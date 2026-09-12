@@ -1,0 +1,34 @@
+services:
+  caddy:
+    image: caddy:2
+    container_name: converter-caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - converter-api
+
+  converter-api:
+    build:
+      context: ./app
+    container_name: converter-api
+    restart: unless-stopped
+    env_file:
+      - .env
+    expose:
+      - "8000"
+    mem_limit: 3g
+    pids_limit: 200
+    security_opt:
+      - no-new-privileges:true
+    tmpfs:
+      - /tmp/converter:uid=10001,gid=10001,mode=700,size=512m
+
+volumes:
+  caddy_data:
+  caddy_config: 

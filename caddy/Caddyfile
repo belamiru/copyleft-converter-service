@@ -1,0 +1,18 @@
+converter.копилефт.рф {
+    @health path /health
+    handle @health {
+        respond "ok" 200
+    }
+
+    @convert path /api/v1/convert
+    handle @convert {
+        request_body {
+            max_size 55MB
+        }
+        reverse_proxy converter-api:8000
+    }
+
+    handle {
+        respond "Not found" 404
+    }
+}
