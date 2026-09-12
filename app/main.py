@@ -1,10 +1,9 @@
 import asyncio
 import os
-import shutil
 import subprocess
 import tempfile
-import uuid
-from pathlib import Path
+import zipfile
+from pathlib import Path, PurePosixPath
 
 from fastapi import FastAPI, File, Header, HTTPException, UploadFile
 from fastapi.responses import Response
@@ -13,7 +12,18 @@ from pypdf import PdfReader
 app = FastAPI(title="Copyleft Converter", docs_url=None, redoc_url=None)
 
 MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB
+MAX_OFFICE_ARCHIVE_FILES = 10_000
+MAX_OFFICE_UNCOMPRESSED_SIZE = 350 * 1024 * 1024  # 350 MB
+MAX_COMPRESSION_RATIO = 100
+
 ALLOWED_EXTENSIONS = {".pdf", ".docx", ".xlsx", ".pptx"}
+
+OFFICE_REQUIRED_FILES = {
+    ".docx": {"[content_types].xml", "word/document.xml"},
+    ".xlsx": {"[content_types].xml", "xl/workbook.xml"},
+    ".pptx": {"[content_types].xml", "ppt/presentation.xml"},
+}
+
 conversion_lock = asyncio.Lock()
 
 
@@ -21,7 +31,10 @@ def check_api_key(authorization: str | None) -> None:
     expected_key = os.environ.get("CONVERTER_API_KEY")
 
     if not expected_key:
-        raise HTTPException(status_code=500, detail="Converter is not configured")
+        raise HTTPException(
+            status_code=500,
+            detail="Converter is not configured",
+        )
 
     if authorization != f"Bearer {expected_key}":
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -29,12 +42,139 @@ def check_api_key(authorization: str | None) -> None:
 
 def get_pdf_page_count(pdf_path: Path) -> int:
     try:
-        return len(PdfReader(str(pdf_path)).pages)
+        page_count = len(PdfReader(str(pdf_path)).pages)
     except Exception as exc:
         raise HTTPException(
             status_code=422,
-            detail="The resulting PDF could not be read",
+            detail="The PDF could not be read",
         ) from exc
+
+    if page_count < 1:
+        raise HTTPException(
+            status_code=422,
+            detail="The PDF does not contain pages",
+        )
+
+    return page_count
+
+
+def ensure_pdf_file(input_path: Path) -> None:
+    try:
+        with input_path.open("rb") as source:
+            signature = source.read(5)
+    except OSError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail="The uploaded PDF could not be read",
+        ) from exc
+
+    if signature != b"%PDF-":
+        raise HTTPException(
+            status_code=422,
+            detail="The file content does not match the PDF format",
+        )
+
+
+def ensure_safe_office_package(input_path: Path, extension: str) -> None:
+    required_files = OFFICE_REQUIRED_FILES[extension]
+
+    try:
+        with zipfile.ZipFile(input_path) as archive:
+            entries = archive.infolist()
+
+            if len(entries) > MAX_OFFICE_ARCHIVE_FILES:
+                raise HTTPException(
+                    status_code=422,
+                    detail="The Office document contains too many internal files",
+                )
+
+            normalized_names = set()
+            total_uncompressed_size = 0
+            total_compressed_size = 0
+
+            for entry in entries:
+                name = entry.filename.replace("\\", "/").lstrip("/")
+
+                if not name or name.endswith("/"):
+                    continue
+
+                path_parts = PurePosixPath(name).parts
+
+                if ".." in path_parts:
+                    raise HTTPException(
+                        status_code=422,
+                        detail="The Office document contains an unsafe internal path",
+                    )
+
+                normalized_name = name.lower()
+                normalized_names.add(normalized_name)
+
+                if entry.flag_bits & 0x1:
+                    raise HTTPException(
+                        status_code=422,
+                        detail="Password-protected Office documents are not supported",
+                    )
+
+                if normalized_name.endswith("vbaproject.bin"):
+                    raise HTTPException(
+                        status_code=422,
+                        detail="Office documents containing macros are not supported",
+                    )
+
+                total_uncompressed_size += entry.file_size
+                total_compressed_size += entry.compress_size
+
+                if total_uncompressed_size > MAX_OFFICE_UNCOMPRESSED_SIZE:
+                    raise HTTPException(
+                        status_code=422,
+                        detail="The Office document is too large after unpacking",
+                    )
+
+            if not required_files.issubset(normalized_names):
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"The file content does not match the {extension[1:].upper()} format"
+                    ),
+                )
+
+            if total_uncompressed_size > 0:
+                if total_compressed_size == 0:
+                    raise HTTPException(
+                        status_code=422,
+                        detail="The Office document has an unsafe compression ratio",
+                    )
+
+                compression_ratio = total_uncompressed_size / total_compressed_size
+
+                if compression_ratio > MAX_COMPRESSION_RATIO:
+                    raise HTTPException(
+                        status_code=422,
+                        detail="The Office document has an unsafe compression ratio",
+                    )
+
+    except HTTPException:
+        raise
+    except zipfile.BadZipFile as exc:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"The file content does not match the {extension[1:].upper()} format"
+            ),
+        ) from exc
+    except OSError as exc:
+        raise HTTPException(
+            status_code=422,
+            detail="The uploaded Office document could not be read",
+        ) from exc
+
+
+def validate_input_file(input_path: Path, extension: str) -> None:
+    if extension == ".pdf":
+        ensure_pdf_file(input_path)
+        return
+
+    ensure_safe_office_package(input_path, extension)
 
 
 @app.get("/internal/health")
@@ -65,19 +205,27 @@ async def convert_file(
             output_dir = work_dir / "output"
             output_dir.mkdir()
 
-            size = 0
+            file_size = 0
+
             with input_path.open("wb") as destination:
                 while chunk := await file.read(1024 * 1024):
-                    size += len(chunk)
-                    if size > MAX_FILE_SIZE:
+                    file_size += len(chunk)
+
+                    if file_size > MAX_FILE_SIZE:
                         raise HTTPException(
                             status_code=413,
                             detail="The file is larger than 50 MB",
                         )
+
                     destination.write(chunk)
 
-            if size == 0:
-                raise HTTPException(status_code=422, detail="The uploaded file is empty")
+            if file_size == 0:
+                raise HTTPException(
+                    status_code=422,
+                    detail="The uploaded file is empty",
+                )
+
+            validate_input_file(input_path, extension)
 
             if extension == ".pdf":
                 pdf_path = input_path
@@ -119,6 +267,7 @@ async def convert_file(
                     ) from exc
 
                 pdf_candidates = list(output_dir.glob("*.pdf"))
+
                 if len(pdf_candidates) != 1:
                     raise HTTPException(
                         status_code=422,
@@ -128,8 +277,6 @@ async def convert_file(
                 pdf_path = pdf_candidates[0]
 
             pages = get_pdf_page_count(pdf_path)
-            download_name = f"{Path(original_name).stem}.pdf"
-
             pdf_bytes = pdf_path.read_bytes()
 
             return Response(
