@@ -12,6 +12,8 @@ from pypdf import PdfReader
 app = FastAPI(title="Copyleft Converter", docs_url=None, redoc_url=None)
 
 MAX_FILE_SIZE = 50 * 1024 * 1024  # 50 MB
+MAX_CONVERTED_PDF_SIZE = 100 * 1024 * 1024  # 100 MB
+MAX_PAGE_COUNT = 10_000
 MAX_OFFICE_ARCHIVE_FILES = 10_000
 MAX_OFFICE_UNCOMPRESSED_SIZE = 350 * 1024 * 1024  # 350 MB
 MAX_COMPRESSION_RATIO = 100
@@ -53,6 +55,15 @@ def get_pdf_page_count(pdf_path: Path) -> int:
         raise HTTPException(
             status_code=422,
             detail="The PDF does not contain pages",
+        )
+
+    if page_count > MAX_PAGE_COUNT:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"The document contains more than "
+                f"{MAX_PAGE_COUNT} pages"
+            ),
         )
 
     return page_count
@@ -134,7 +145,8 @@ def ensure_safe_office_package(input_path: Path, extension: str) -> None:
                 raise HTTPException(
                     status_code=422,
                     detail=(
-                        f"The file content does not match the {extension[1:].upper()} format"
+                        f"The file content does not match the "
+                        f"{extension[1:].upper()} format"
                     ),
                 )
 
@@ -145,7 +157,9 @@ def ensure_safe_office_package(input_path: Path, extension: str) -> None:
                         detail="The Office document has an unsafe compression ratio",
                     )
 
-                compression_ratio = total_uncompressed_size / total_compressed_size
+                compression_ratio = (
+                    total_uncompressed_size / total_compressed_size
+                )
 
                 if compression_ratio > MAX_COMPRESSION_RATIO:
                     raise HTTPException(
@@ -159,7 +173,8 @@ def ensure_safe_office_package(input_path: Path, extension: str) -> None:
         raise HTTPException(
             status_code=422,
             detail=(
-                f"The file content does not match the {extension[1:].upper()} format"
+                f"The file content does not match the "
+                f"{extension[1:].upper()} format"
             ),
         ) from exc
     except OSError as exc:
@@ -277,7 +292,34 @@ async def convert_file(
                 pdf_path = pdf_candidates[0]
 
             pages = get_pdf_page_count(pdf_path)
-            pdf_bytes = pdf_path.read_bytes()
+
+            try:
+                pdf_size = pdf_path.stat().st_size
+            except OSError as exc:
+                raise HTTPException(
+                    status_code=422,
+                    detail="The converted PDF could not be read",
+                ) from exc
+
+            if pdf_size < 1:
+                raise HTTPException(
+                    status_code=422,
+                    detail="The converted PDF is empty",
+                )
+
+            if pdf_size > MAX_CONVERTED_PDF_SIZE:
+                raise HTTPException(
+                    status_code=422,
+                    detail="The converted PDF is larger than 100 MB",
+                )
+
+            try:
+                pdf_bytes = pdf_path.read_bytes()
+            except OSError as exc:
+                raise HTTPException(
+                    status_code=422,
+                    detail="The converted PDF could not be read",
+                ) from exc
 
             return Response(
                 content=pdf_bytes,
